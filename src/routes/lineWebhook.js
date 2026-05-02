@@ -14,6 +14,7 @@ import { callClaude } from '../lib/aiClient.js';
 // 模式：'n8n' = 把事件 forward 給 n8n（待 workflow active 後）
 //      'direct' = Node 直接呼叫 AI + LINE reply
 const MODE = process.env.AGENT_MODE || 'direct';
+console.log('[AGENT_MODE]', JSON.stringify(MODE), 'raw=', JSON.stringify(process.env.AGENT_MODE));
 
 export function createLineWebhookRouter(logger) {
   const router = express.Router();
@@ -66,11 +67,13 @@ async function handleEvent(event, logger) {
   const user = await upsertUser({ lineUserId, displayName });
   await insertMessage({ userId: user.id, role: 'user', content: text });
 
+  logger.info({ MODE, line_user: lineUserId.slice(0, 6) }, 'handleEvent start');
   if (MODE === 'n8n') {
     try {
       await forwardToN8n({
         lineUserId, userId: user.id, displayName, message: text, replyToken, timestamp: event.timestamp,
       });
+      logger.info('forwarded to n8n, returning');
       return;
     } catch (err) {
       logger.error({ err: err.message }, 'n8n forward 失敗，fallback 到 direct');

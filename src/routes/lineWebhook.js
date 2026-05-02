@@ -1,22 +1,32 @@
 import express from 'express';
 import { verifyLineSignature } from '../lib/verifySignature.js';
-import { upsertUser, insertMessage } from '../lib/supabaseClient.js';
+import {
+  upsertUser,
+  insertMessage,
+  getRecentMessages,
+  searchKnowledge,
+  createTicket,
+} from '../lib/supabaseClient.js';
 import { forwardToN8n } from '../lib/n8nClient.js';
-import { lineReplyText, getLineProfile } from '../lib/lineClient.js';
+import { lineReplyText, linePushText, getLineProfile } from '../lib/lineClient.js';
+import { callClaude } from '../lib/aiClient.js';
+
+// 模式：'n8n' = 把事件 forward 給 n8n（待 workflow active 後）
+//      'direct' = Node 直接呼叫 AI + LINE reply
+const MODE = process.env.AGENT_MODE || 'direct';
 
 export function createLineWebhookRouter(logger) {
   const router = express.Router();
 
   router.post('/', async (req, res) => {
     const signature = req.get('x-line-signature') || '';
-    const rawBody = req.body; // Buffer，因 express.raw
+    const rawBody = req.body;
 
     if (!verifyLineSignature(rawBody, signature, process.env.LINE_CHANNEL_SECRET)) {
       logger.warn('LINE signature 驗證失敗');
       return res.status(401).send('invalid signature');
     }
 
-    // LINE 平台要求 webhook 必須在數秒內回應 200，否則會 retry
     res.status(200).end();
 
     let payload;
@@ -29,7 +39,7 @@ export function createLineWebhookRouter(logger) {
 
     for (const event of payload.events || []) {
       handleEvent(event, logger).catch((err) => {
-        logger.error({ err, event }, '處理 LINE event 失敗');
+        logger.error({ err: err.message, event }, '處理 LINE event 失敗');
       });
     }
   });
@@ -38,57 +48,85 @@ export function createLineWebhookRouter(logger) {
 }
 
 async function handleEvent(event, logger) {
-  if (event.type !== 'message' || event.message?.type !== 'text') {
-    // 目前僅處理文字訊息；圖片、貼圖可在此擴充
-    return;
-  }
+  if (event.type !== 'message' || event.message?.type !== 'text') return;
 
   const lineUserId = event.source?.userId;
   const text = event.message.text;
   const replyToken = event.replyToken;
-  const timestamp = event.timestamp;
+  if (!lineUserId) return;
 
-  if (!lineUserId) {
-    logger.warn({ event }, '缺少 source.userId，略過');
-    return;
-  }
-
-  // 取得使用者顯示名稱（可能因為未加好友而失敗，要容錯）
   let displayName = null;
   try {
     const profile = await getLineProfile(lineUserId);
     displayName = profile?.displayName ?? null;
   } catch (err) {
-    logger.warn({ err: err.message, lineUserId }, '取得 LINE profile 失敗，略過');
+    logger.warn({ err: err.message }, '取得 LINE profile 失敗');
   }
 
-  // 1. upsert 使用者
   const user = await upsertUser({ lineUserId, displayName });
+  await insertMessage({ userId: user.id, role: 'user', content: text });
 
-  // 2. 寫入訊息（user 角色）
+  if (MODE === 'n8n') {
+    try {
+      await forwardToN8n({
+        lineUserId, userId: user.id, displayName, message: text, replyToken, timestamp: event.timestamp,
+      });
+      return;
+    } catch (err) {
+      logger.error({ err: err.message }, 'n8n forward 失敗，fallback 到 direct');
+    }
+  }
+
+  // === direct mode：Node 自己跑 AI + LINE reply ===
+  let parsed;
+  try {
+    const [history, knowledge] = await Promise.all([
+      getRecentMessages(user.id, 8),
+      searchKnowledge(text),
+    ]);
+    parsed = await callClaude({ message: text, history, knowledge });
+  } catch (err) {
+    logger.error({ err: err.message }, 'AI 呼叫失敗');
+    parsed = {
+      reply: '抱歉，系統暫時無法回覆，已記錄您的訊息，稍後將為您處理。',
+      intent: 'unknown',
+      needs_human: true,
+      priority: 'high',
+      summary: text.slice(0, 30),
+    };
+  }
+
   await insertMessage({
     userId: user.id,
-    role: 'user',
-    content: text,
+    role: 'assistant',
+    content: parsed.reply,
+    intent: parsed.intent,
   });
 
-  // 3. 把事件 forward 給 n8n，讓 n8n 跑 AI / 知識庫 / 工單流程
   try {
-    await forwardToN8n({
-      lineUserId,
-      userId: user.id,
-      displayName,
-      message: text,
-      replyToken,
-      timestamp,
-    });
+    await lineReplyText(replyToken, parsed.reply);
   } catch (err) {
-    logger.error({ err: err.message }, 'forward to n8n 失敗，回退預設訊息');
-    // n8n 掛掉時的 fallback：直接回覆使用者讓他不要等
+    logger.error({ err: err.message }, 'LINE reply 失敗（可能 replyToken 過期）');
+  }
+
+  if (parsed.needs_human) {
     try {
-      await lineReplyText(replyToken, '系統忙碌中，已記錄您的訊息，稍後將為您回覆，謝謝。');
-    } catch (e) {
-      logger.error({ err: e.message }, 'fallback reply 失敗');
+      const ticket = await createTicket({
+        userId: user.id,
+        issue: text,
+        intent: parsed.intent,
+        priority: parsed.priority,
+      });
+      const adminMsg =
+        `🚨 新工單 #${ticket.id.slice(0, 8)}\n` +
+        `User: ${displayName || lineUserId}\n` +
+        `Intent: ${parsed.intent} / ${parsed.priority}\n` +
+        `訊息: ${text}\n` +
+        `摘要: ${parsed.summary}`;
+      const adminId = process.env.LINE_ADMIN_USER_ID;
+      if (adminId) await linePushText(adminId, adminMsg);
+    } catch (err) {
+      logger.error({ err: err.message }, '建立工單或通知 admin 失敗');
     }
   }
 }

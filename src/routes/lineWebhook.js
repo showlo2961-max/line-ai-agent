@@ -103,8 +103,18 @@ async function handleEvent(event, logger) {
     intent: parsed.intent,
   });
 
+  // 預設 quick replies — 若 AI 已轉專人就只給「結束對話」
+  const quickReplies = parsed.needs_human
+    ? [{ label: '我知道了', text: '謝謝' }]
+    : [
+        { label: '預約諮詢', text: '我想預約' },
+        { label: '服務介紹', text: '請介紹你們的服務' },
+        { label: '訂單查詢', text: '我要查詢訂單' },
+        { label: '找真人', text: '我想找真人客服' },
+      ];
+
   try {
-    await lineReplyText(replyToken, parsed.reply);
+    await lineReplyText(replyToken, parsed.reply, quickReplies);
   } catch (err) {
     logger.error({ err: err.message }, 'LINE reply 失敗（可能 replyToken 過期）');
   }

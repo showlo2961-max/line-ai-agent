@@ -9,14 +9,24 @@ function authHeaders() {
   };
 }
 
-export async function lineReplyText(replyToken, text) {
+export async function lineReplyText(replyToken, text, quickReplies = null) {
+  const message = { type: 'text', text: truncate(text, 4900) };
+  if (quickReplies?.length) {
+    message.quickReply = {
+      items: quickReplies.slice(0, 13).map((q) => ({
+        type: 'action',
+        action: {
+          type: 'message',
+          label: (q.label || q.text || '').slice(0, 20),
+          text: q.text || q.label,
+        },
+      })),
+    };
+  }
   const res = await fetch(`${LINE_API}/message/reply`, {
     method: 'POST',
     headers: authHeaders(),
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: 'text', text: truncate(text, 4900) }],
-    }),
+    body: JSON.stringify({ replyToken, messages: [message] }),
   });
   if (!res.ok) {
     const body = await res.text();

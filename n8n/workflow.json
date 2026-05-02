@@ -1,0 +1,288 @@
+{
+  "name": "LINE AI Agent - Main",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "line-agent",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1-webhook",
+      "name": "Webhook (from Node backend)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.headers['x-shared-secret']}}",
+              "operation": "equal",
+              "value2": "={{$env.N8N_SHARED_SECRET}}"
+            }
+          ]
+        }
+      },
+      "id": "2-auth",
+      "name": "Auth Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [400, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const b = $json.body || $json;\nreturn [{ json: {\n  lineUserId: b.lineUserId,\n  userId:     b.userId,\n  displayName: b.displayName || null,\n  message:    b.message,\n  replyToken: b.replyToken,\n  timestamp:  b.timestamp,\n  receivedAt: new Date().toISOString()\n}}];"
+      },
+      "id": "3-normalize",
+      "name": "Function: Normalize",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [600, 240]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "knowledge_base",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "is_active",
+              "condition": "eq",
+              "keyValue": "true"
+            }
+          ]
+        },
+        "limit": 50
+      },
+      "id": "4-kb",
+      "name": "Supabase: Knowledge Base",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [800, 200],
+      "credentials": { "supabaseApi": { "name": "Supabase main" } }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "messages",
+        "filters": {
+          "conditions": [
+            { "keyName": "user_id", "condition": "eq", "keyValue": "={{$('Function: Normalize').item.json.userId}}" }
+          ]
+        },
+        "options": { "sort": [{ "field": "created_at", "direction": "DESC" }] },
+        "limit": 10
+      },
+      "id": "5-history",
+      "name": "Supabase: Recent Messages",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [800, 360],
+      "credentials": { "supabaseApi": { "name": "Supabase main" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",      "value": "={{$env.ANTHROPIC_API_KEY}}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type",   "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-6\",\n  \"max_tokens\": 800,\n  \"system\": $env.SYSTEM_PROMPT,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"使用者訊息：\" + $('Function: Normalize').item.json.message + \"\\n\\n知識庫（請優先依此回答，找不到就誠實說明）：\\n\" + JSON.stringify($('Supabase: Knowledge Base').all().map(i => i.json)) + \"\\n\\n最近對話歷史（由舊到新）：\\n\" + JSON.stringify($('Supabase: Recent Messages').all().map(i => i.json).reverse()) + \"\\n\\n請務必只回 JSON，欄位：reply, intent, needs_human, priority, summary。\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "6-ai",
+      "name": "HTTP: Claude API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1040, 280]
+    },
+    {
+      "parameters": {
+        "functionCode": "const raw = $json.content?.[0]?.text || $json.choices?.[0]?.message?.content || '{}';\nlet parsed;\ntry { parsed = JSON.parse(raw); }\ncatch(e) {\n  // 嘗試從 markdown code block 抽取\n  const m = raw.match(/\\{[\\s\\S]*\\}/);\n  parsed = m ? JSON.parse(m[0]) : { reply: raw, intent: 'unknown', needs_human: true, priority: 'medium', summary: raw.slice(0,80) };\n}\nreturn [{ json: parsed }];"
+      },
+      "id": "7-parse",
+      "name": "Function: Parse AI JSON",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [1240, 280]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "tableId": "messages",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "user_id", "fieldValue": "={{$('Function: Normalize').item.json.userId}}" },
+            { "fieldId": "role",    "fieldValue": "assistant" },
+            { "fieldId": "content", "fieldValue": "={{$json.reply}}" },
+            { "fieldId": "intent",  "fieldValue": "={{$json.intent}}" }
+          ]
+        }
+      },
+      "id": "8-save-msg",
+      "name": "Supabase: Save Assistant Msg",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1440, 200],
+      "credentials": { "supabaseApi": { "name": "Supabase main" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.line.me/v2/bot/message/reply",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$env.LINE_CHANNEL_ACCESS_TOKEN}}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"replyToken\": $('Function: Normalize').item.json.replyToken,\n  \"messages\": [{ \"type\": \"text\", \"text\": $('Function: Parse AI JSON').item.json.reply }]\n}"
+      },
+      "id": "9-line-reply",
+      "name": "HTTP: LINE Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1640, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            { "value1": "={{$('Function: Parse AI JSON').item.json.needs_human}}", "value2": true }
+          ]
+        }
+      },
+      "id": "10-if-human",
+      "name": "IF: Needs Human?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1440, 440]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "tableId": "tickets",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "user_id",  "fieldValue": "={{$('Function: Normalize').item.json.userId}}" },
+            { "fieldId": "issue",    "fieldValue": "={{$('Function: Normalize').item.json.message}}" },
+            { "fieldId": "intent",   "fieldValue": "={{$('Function: Parse AI JSON').item.json.intent}}" },
+            { "fieldId": "priority", "fieldValue": "={{$('Function: Parse AI JSON').item.json.priority}}" },
+            { "fieldId": "status",   "fieldValue": "open" }
+          ]
+        }
+      },
+      "id": "11-ticket",
+      "name": "Supabase: Create Ticket",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1640, 440],
+      "credentials": { "supabaseApi": { "name": "Supabase main" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.line.me/v2/bot/message/push",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{$env.LINE_CHANNEL_ACCESS_TOKEN}}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"to\": $env.LINE_ADMIN_USER_ID,\n  \"messages\": [{\n    \"type\": \"text\",\n    \"text\": \"🚨 新工單 #\" + $json.id + \"\\n\" +\n            \"User: \" + ($('Function: Normalize').item.json.displayName || $('Function: Normalize').item.json.lineUserId) + \"\\n\" +\n            \"Intent: \" + $('Function: Parse AI JSON').item.json.intent + \" / \" + $('Function: Parse AI JSON').item.json.priority + \"\\n\" +\n            \"訊息: \" + $('Function: Normalize').item.json.message + \"\\n\" +\n            \"摘要: \" + $('Function: Parse AI JSON').item.json.summary\n  }]\n}"
+      },
+      "id": "12-notify-admin",
+      "name": "HTTP: LINE Notify Admin",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1840, 440]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "tableId": "admin_notifications",
+        "fieldsUi": {
+          "fieldValues": [
+            { "fieldId": "ticket_id", "fieldValue": "={{$('Supabase: Create Ticket').item.json.id}}" },
+            { "fieldId": "channel",   "fieldValue": "line" },
+            { "fieldId": "status",    "fieldValue": "sent" }
+          ]
+        }
+      },
+      "id": "13-log-notify",
+      "name": "Supabase: Log Notification",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [2040, 440],
+      "credentials": { "supabaseApi": { "name": "Supabase main" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\"ok\": true}"
+      },
+      "id": "14-respond",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1840, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseCode": 401,
+        "responseBody": "={\"error\":\"unauthorized\"}"
+      },
+      "id": "15-unauth",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [600, 440]
+    }
+  ],
+  "connections": {
+    "Webhook (from Node backend)":      { "main": [[ { "node": "Auth Check", "type": "main", "index": 0 } ]] },
+    "Auth Check":                        { "main": [
+      [ { "node": "Function: Normalize", "type": "main", "index": 0 } ],
+      [ { "node": "Respond 401", "type": "main", "index": 0 } ]
+    ]},
+    "Function: Normalize":               { "main": [[
+      { "node": "Supabase: Knowledge Base", "type": "main", "index": 0 },
+      { "node": "Supabase: Recent Messages", "type": "main", "index": 0 }
+    ]]},
+    "Supabase: Knowledge Base":          { "main": [[ { "node": "HTTP: Claude API", "type": "main", "index": 0 } ]] },
+    "Supabase: Recent Messages":         { "main": [[ { "node": "HTTP: Claude API", "type": "main", "index": 0 } ]] },
+    "HTTP: Claude API":                  { "main": [[ { "node": "Function: Parse AI JSON", "type": "main", "index": 0 } ]] },
+    "Function: Parse AI JSON":           { "main": [[
+      { "node": "Supabase: Save Assistant Msg", "type": "main", "index": 0 },
+      { "node": "IF: Needs Human?", "type": "main", "index": 0 }
+    ]]},
+    "Supabase: Save Assistant Msg":      { "main": [[ { "node": "HTTP: LINE Reply", "type": "main", "index": 0 } ]] },
+    "HTTP: LINE Reply":                  { "main": [[ { "node": "Respond 200", "type": "main", "index": 0 } ]] },
+    "IF: Needs Human?":                  { "main": [
+      [ { "node": "Supabase: Create Ticket", "type": "main", "index": 0 } ],
+      []
+    ]},
+    "Supabase: Create Ticket":           { "main": [[ { "node": "HTTP: LINE Notify Admin", "type": "main", "index": 0 } ]] },
+    "HTTP: LINE Notify Admin":           { "main": [[ { "node": "Supabase: Log Notification", "type": "main", "index": 0 } ]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
